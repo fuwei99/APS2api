@@ -1,0 +1,43 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, name: linux-amd64 }
+          - { goos: linux,   goarch: arm64, name: linux-arm64 }
+          - { goos: windows, goarch: amd64, name: windows-amd64, ext: ".exe" }
+          - { goos: darwin,  goarch: arm64, name: darwin-arm64 }
+          - { goos: darwin,  goarch: amd64, name: darwin-amd64 }
+          - { goos: android, goarch: arm64, name: android-arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build ${{ matrix.name }}
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags="-s -w" -o vproxy${{ matrix.ext }} ./cmd/vproxy
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vproxy-${{ matrix.name }}
+          path: vproxy${{ matrix.ext }}
+          if-no-files-found: error
