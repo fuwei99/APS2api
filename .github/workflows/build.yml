@@ -29,12 +29,29 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # 模块代理偶发 "stream error / INTERNAL_ERROR"（HTTP2 抖动）时，
+      # go 命令不会自动切到 GOPROXY 列表里的下一个镜像（只在 404/410 才切），
+      # 所以这里必须自己重试，否则整个 matrix job 直接红。
       - name: Build ${{ matrix.name }}
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: go build -trimpath -ldflags="-s -w" -o vproxy${{ matrix.ext }} ./cmd/vproxy
+          GOTOOLCHAIN: local
+        run: |
+          for attempt in 1 2 3 4; do
+            echo "::group::build attempt ${attempt}/4 (${{ matrix.name }})"
+            if go build -trimpath -ldflags="-s -w" -o vproxy${{ matrix.ext }} ./cmd/vproxy; then
+              echo "::endgroup::"
+              echo "build ok on attempt ${attempt}"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "attempt ${attempt} failed (transient module-proxy error?), retry in 15s"
+            sleep 15
+          done
+          echo "::error::all 4 build attempts failed"
+          exit 1
 
       - uses: actions/upload-artifact@v4
         with:
