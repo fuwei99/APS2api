@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +29,154 @@ var (
 	//nolint:gochecknoglobals // Admin sessions state
 	adminSessions = map[string]time.Time{}
 )
+
+// ---- 登录失败锁定（按客户端 IP，不按账号）----
+//
+// 为什么不按账号：本程序只有一个管理员账号，"按账号锁定"等于一把全局锁，
+// 任何人故意错 3 次就能把机主本人一起锁在门外（已实测踩到这个坑）。
+// 按 IP 锁定只惩罚发起爆破的那个来源，其他 IP 正常登录不受影响。
+//
+// 同一个 IP 连续失败 adminMaxFailures 次即锁定该 IP；解锁后再失败会拉长锁定时长
+// （递增、封顶 adminLockMax）。登录成功、或距上次失败超过 adminFailureResetAfter
+// 都没有新失败，则该 IP 的计数清零。
+const (
+	adminMaxFailures       = 3
+	adminLockBase          = 5 * time.Minute
+	adminLockMax           = 60 * time.Minute
+	adminFailureResetAfter = time.Hour
+	adminLockSweepSize     = 512 // 条目超过这个数才做一次过期清理
+)
+
+type adminIPLock struct {
+	failures    int
+	lockLevel   int
+	lockedUntil time.Time
+	lastFailure time.Time
+}
+
+var (
+	//nolint:gochecknoglobals // Admin login lock state
+	adminLockMu sync.Mutex
+	//nolint:gochecknoglobals // Admin login lock state
+	adminLocks = map[string]*adminIPLock{}
+)
+
+// clientIP 取真实客户端 IP。
+//
+// 本服务跑在 cloudflared 隧道后面，隧道连接器从 127.0.0.1 发起请求，
+// 所以 r.RemoteAddr 永远是 127.0.0.1——直接拿它当 IP 会让"按 IP 锁定"退化成全局锁。
+// 真实客户端 IP 由 Cloudflare 注入在 CF-Connecting-IP 头里。
+//
+// 安全约束：只有当请求确实来自本机（隧道连接器）时才信任这些转发头，
+// 否则公网直连者可以自己伪造 CF-Connecting-IP，靠换 IP 绕过锁定。
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if v := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); v != "" {
+			return v
+		}
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if i := strings.IndexByte(xff, ','); i >= 0 {
+				xff = xff[:i]
+			}
+			if v := strings.TrimSpace(xff); v != "" {
+				return v
+			}
+		}
+	}
+	return host
+}
+
+// adminLockRemainingFor 返回该 IP 剩余的锁定时长；未锁定返回 0。
+func adminLockRemainingFor(ip string) time.Duration {
+	adminLockMu.Lock()
+	defer adminLockMu.Unlock()
+	entry, ok := adminLocks[ip]
+	if !ok {
+		return 0
+	}
+	if entry.lockedUntil.After(time.Now()) {
+		return time.Until(entry.lockedUntil)
+	}
+	return 0
+}
+
+// recordAdminLoginFailureFor 记一次该 IP 的登录失败。
+// 返回 >0 表示本次失败触发了锁定，值为锁定时长。
+func recordAdminLoginFailureFor(ip string) time.Duration {
+	adminLockMu.Lock()
+	defer adminLockMu.Unlock()
+
+	now := time.Now()
+	sweepAdminLocksLocked(now)
+
+	entry, ok := adminLocks[ip]
+	if !ok {
+		entry = &adminIPLock{} //nolint:exhaustruct // 新条目从零开始
+		adminLocks[ip] = entry
+	}
+	if !entry.lastFailure.IsZero() && now.Sub(entry.lastFailure) > adminFailureResetAfter {
+		entry.failures = 0
+		entry.lockLevel = 0
+	}
+	entry.failures++
+	entry.lastFailure = now
+
+	if entry.failures < adminMaxFailures {
+		return 0
+	}
+
+	lockFor := adminLockBase
+	for i := 0; i < entry.lockLevel; i++ {
+		lockFor *= 3
+		if lockFor >= adminLockMax {
+			lockFor = adminLockMax
+			break
+		}
+	}
+	if entry.lockLevel < 10 {
+		entry.lockLevel++
+	}
+	entry.lockedUntil = now.Add(lockFor)
+	entry.failures = 0 // 计数归零：解锁后再错满 3 次才会再次锁定（且锁得更久）
+	return lockFor
+}
+
+// recordAdminLoginSuccessFor 该 IP 登录成功，清空它的失败计数与锁定级别。
+func recordAdminLoginSuccessFor(ip string) {
+	adminLockMu.Lock()
+	delete(adminLocks, ip)
+	adminLockMu.Unlock()
+}
+
+// sweepAdminLocksLocked 清理长期无活动的条目，避免 map 无限增长。调用方需持锁。
+func sweepAdminLocksLocked(now time.Time) {
+	if len(adminLocks) <= adminLockSweepSize {
+		return
+	}
+	for ip, entry := range adminLocks {
+		if !entry.lockedUntil.After(now) && now.Sub(entry.lastFailure) > adminFailureResetAfter {
+			delete(adminLocks, ip)
+		}
+	}
+}
+
+// writeAdminLocked 统一返回 429，并告知还需等待多久。
+func writeAdminLocked(w http.ResponseWriter, left time.Duration) {
+	secs := int(left.Seconds())
+	if secs < 1 {
+		secs = 1
+	}
+	mins := (secs + 59) / 60
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	writeJSON(w, http.StatusTooManyRequests, adminErr(fmt.Sprintf(
+		"该 IP 密码错误次数过多，登录已锁定，请约 %d 分钟后重试 (too many failed attempts from this IP, locked for ~%d min)",
+		mins, mins,
+	)))
+}
 
 func issueAdminToken() string {
 	b := make([]byte, 32)
@@ -141,6 +291,14 @@ func (adm *AdminHandler) adminLogin(w http.ResponseWriter, r *http.Request) {
 		adm.adminMethodNotAllowed(w)
 		return
 	}
+	ip := clientIP(r)
+	// 该 IP 处于锁定期就直接拒绝，连密码都不比对——否则锁定形同虚设。
+	if left := adminLockRemainingFor(ip); left > 0 {
+		log.Printf("[Security] 后台登录处于锁定期，拒绝请求。剩余 %s。来源 IP: %s",
+			left.Round(time.Second), ip)
+		writeAdminLocked(w, left)
+		return
+	}
 	var body struct {
 		Password string `json:"password"`
 	}
@@ -153,11 +311,19 @@ func (adm *AdminHandler) adminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(body.Password)), []byte(expected)) != 1 {
-		log.Printf("[Security] 警告：后台登录失败，密码错误。来源 IP: %s", r.RemoteAddr)
+		lockFor := recordAdminLoginFailureFor(ip)
+		log.Printf("[Security] 警告：后台登录失败，密码错误。来源 IP: %s", ip)
+		if lockFor > 0 {
+			log.Printf("[Security] 该 IP 连续失败达 %d 次，已锁定 %s。来源 IP: %s",
+				adminMaxFailures, lockFor, ip)
+			writeAdminLocked(w, lockFor)
+			return
+		}
 		writeJSON(w, http.StatusUnauthorized, adminErr("密码错误 (invalid password)"))
 		return
 	}
-	log.Printf("[Admin] 管理后台登录成功。来源 IP: %s", r.RemoteAddr)
+	recordAdminLoginSuccessFor(ip)
+	log.Printf("[Admin] 管理后台登录成功。来源 IP: %s", ip)
 	cleanupAdminSessions()
 	tok := issueAdminToken()
 	http.SetCookie(w, &http.Cookie{

@@ -3,6 +3,7 @@ config/config.json
 config/api_keys.txt
 config/nodes.json
 config/node_health.json
+config/subscriptions.json
 
 # SQLite database and WAL files
 config/data.db
@@ -12,6 +13,10 @@ config/data.db-wal
 # Binaries
 vertex-proxy
 vertex-proxy-*
+vproxy
+vproxy-*
+vproxy.bak.*
+vproxy.new
 *.exe
 *~
 
